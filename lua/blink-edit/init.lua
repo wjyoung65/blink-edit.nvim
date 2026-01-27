@@ -1,0 +1,457 @@
+---@class BlinkEdit
+---@field config BlinkEditConfig
+---@field state table|nil
+---@field engine table|nil
+local M = {}
+
+local config = require("blink-edit.config")
+local transport = require("blink-edit.transport")
+local commands = require("blink-edit.commands")
+local engine = require("blink-edit.core.engine")
+local render = require("blink-edit.core.render")
+local state = require("blink-edit.core.state")
+local utils = require("blink-edit.utils")
+local log = require("blink-edit.log")
+
+---@type boolean
+local initialized = false
+
+--- Setup blink-edit with user configuration
+---@param user_config? table
+function M.setup(user_config)
+  if initialized then
+    log.warn("Already initialized, call reset() first")
+    return
+  end
+
+  -- Initialize configuration
+  config.setup(user_config)
+  local cfg = config.get()
+
+  if cfg.context and cfg.context.enabled == false then
+    state.clear_history()
+    state.clear_selection()
+  end
+
+  -- Setup highlights
+  M._setup_highlights()
+
+  -- Setup keymaps
+  M._setup_keymaps()
+
+  -- Setup autocmds
+  M._setup_autocmds()
+
+  initialized = true
+
+  -- Log successful initialization (debug only)
+  if vim.g.blink_edit_debug then
+    log.debug(
+      string.format(
+        "Initialized: mode=%s, backend=%s, provider=%s, url=%s",
+        cfg.mode,
+        cfg.llm.backend,
+        cfg.llm.provider,
+        cfg.llm.url
+      ),
+      vim.log.levels.INFO
+    )
+  end
+
+  -- Setup commands
+  commands.setup({
+    enable = M.enable,
+    disable = M.disable,
+    toggle = M.toggle,
+    status = M.status,
+    health = M.health_check,
+  })
+end
+
+--- Setup highlight groups
+function M._setup_highlights()
+  local cfg = config.get()
+
+  vim.api.nvim_set_hl(0, "BlinkEditAddition", cfg.highlight.addition)
+  vim.api.nvim_set_hl(0, "BlinkEditDeletion", cfg.highlight.deletion)
+  vim.api.nvim_set_hl(0, "BlinkEditPreview", cfg.highlight.preview)
+end
+
+--- Setup keymaps for accepting/rejecting predictions
+function M._setup_keymaps()
+  local cfg = config.get()
+
+  -- Accept prediction with Tab (only when prediction visible)
+  -- Uses vim.schedule() to defer buffer modification outside textlock
+  vim.keymap.set("i", cfg.accept_key, function()
+    -- Let completion engines handle Tab when menu is visible
+    if package.loaded["blink.cmp"] then
+      local ok, blink_cmp = pcall(require, "blink.cmp")
+      if ok and blink_cmp.is_visible and blink_cmp.is_visible() then
+        return cfg.accept_key
+      end
+    end
+
+    if package.loaded["cmp"] then
+      local ok, cmp = pcall(require, "cmp")
+      if ok and cmp.visible() then
+        return cfg.accept_key
+      end
+    end
+
+    if M.has_prediction() then
+      vim.schedule(function()
+        M.accept()
+      end)
+      return "" -- Consume the key, prevents fallback to other handlers
+    end
+    -- Fall through to default Tab behavior (e.g., blink.cmp)
+    return cfg.accept_key
+  end, { expr = true, noremap = true, desc = "Accept blink-edit prediction" })
+
+  -- Reject prediction with Esc
+  -- Uses vim.schedule() to defer buffer modification outside textlock
+  vim.keymap.set("i", cfg.reject_key, function()
+    if M.has_prediction() then
+      vim.schedule(function()
+        M.reject()
+      end)
+      return "" -- Consume the key
+    end
+    -- Fall through to default Esc behavior
+    return cfg.reject_key
+  end, { expr = true, noremap = true, desc = "Reject blink-edit prediction" })
+end
+
+--- Setup autocmds for triggering predictions
+function M._setup_autocmds()
+  local augroup = vim.api.nvim_create_augroup("BlinkEdit", { clear = true })
+
+  -- Capture baseline on InsertEnter
+  vim.api.nvim_create_autocmd("InsertEnter", {
+    group = augroup,
+    callback = function(args)
+      engine.on_insert_enter(args.buf)
+    end,
+    desc = "Capture baseline for blink-edit on insert enter",
+  })
+
+  -- Trigger prediction on text change
+  vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
+    group = augroup,
+    callback = function(args)
+      M._on_text_changed(args.buf)
+    end,
+    desc = "Trigger blink-edit prediction on text change",
+  })
+
+  -- Check cursor movement
+  vim.api.nvim_create_autocmd("CursorMovedI", {
+    group = augroup,
+    callback = function(args)
+      M._on_cursor_moved(args.buf)
+    end,
+    desc = "Handle cursor movement for blink-edit",
+  })
+
+  -- Cleanup on insert leave
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    group = augroup,
+    callback = function(args)
+      engine.on_insert_leave(args.buf)
+    end,
+    desc = "Cleanup blink-edit on insert leave",
+  })
+
+  -- Clear prediction on buffer leave
+  vim.api.nvim_create_autocmd("BufLeave", {
+    group = augroup,
+    callback = function(args)
+      engine.cancel(args.buf)
+    end,
+    desc = "Cancel blink-edit on buffer leave",
+  })
+
+  -- Cleanup on buffer delete
+  vim.api.nvim_create_autocmd("BufDelete", {
+    group = augroup,
+    callback = function(args)
+      state.clear(args.buf)
+    end,
+    desc = "Cleanup blink-edit state on buffer delete",
+  })
+
+  -- Capture visual selection on mode change (Visual -> non-Visual)
+  -- Pattern matches: v/V/Ctrl-V (visual modes) changing to any non-visual mode
+  vim.api.nvim_create_autocmd("ModeChanged", {
+    group = augroup,
+    pattern = { "[vV\x16]*:[^vV\x16]*" },
+    callback = function(args)
+      M._capture_selection(args.buf)
+    end,
+    desc = "Capture visual selection for blink-edit",
+  })
+
+  -- Also capture on yank (y in visual mode) - ensures selection is captured when copying
+  vim.api.nvim_create_autocmd("TextYankPost", {
+    group = augroup,
+    callback = function(args)
+      local event = vim.v.event
+      if event and event.visual then
+        M._capture_selection(args.buf)
+      end
+    end,
+    desc = "Capture yanked selection for blink-edit",
+  })
+end
+
+--- Capture visual selection for context
+---@param bufnr number
+function M._capture_selection(bufnr)
+  local cfg = config.get()
+  if not cfg.context.enabled or not cfg.context.selection.enabled then
+    return
+  end
+
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local start_line = start_pos[2]
+  local end_line = end_pos[2]
+
+  if start_line == 0 or end_line == 0 then
+    return
+  end
+
+  if start_line > end_line then
+    start_line, end_line = end_line, start_line
+  end
+
+  local lines = state.get_lines_range(bufnr, start_line, end_line)
+  if #lines == 0 then
+    return
+  end
+
+  local filepath = utils.normalize_filepath(vim.api.nvim_buf_get_name(bufnr))
+
+  state.set_selection(bufnr, {
+    filepath = filepath,
+    start_line = start_line,
+    end_line = end_line,
+    lines = lines,
+    timestamp = vim.uv.now(),
+  })
+
+  if vim.g.blink_edit_debug then
+    log.debug(string.format("Selection captured: %s lines %d-%d (%d lines)", filepath, start_line, end_line, #lines))
+  end
+end
+
+--- Called on text change in insert mode
+---@param bufnr number
+function M._on_text_changed(bufnr)
+  -- Check if plugin is enabled
+  if vim.g.blink_edit_enabled == false then
+    return
+  end
+
+  -- Skip special buffer types
+  local buftype = vim.bo[bufnr].buftype
+  if buftype ~= "" then
+    return
+  end
+
+  -- Skip read-only or unmodifiable buffers
+  if vim.bo[bufnr].readonly or not vim.bo[bufnr].modifiable then
+    return
+  end
+
+  -- Check if filetype is enabled
+  local ft = vim.bo[bufnr].filetype
+  if not config.is_filetype_enabled(ft) then
+    return
+  end
+
+  -- Trigger prediction via engine (debounced)
+  engine.trigger(bufnr)
+end
+
+--- Called on cursor move in insert mode
+---@param bufnr number
+function M._on_cursor_moved(bufnr)
+  engine.on_cursor_moved(bufnr)
+end
+
+--- Check if there's an active prediction
+---@return boolean
+function M.has_prediction()
+  local bufnr = vim.api.nvim_get_current_buf()
+  return engine.has_prediction(bufnr)
+end
+
+--- Accept the current prediction
+function M.accept()
+  local bufnr = vim.api.nvim_get_current_buf()
+  engine.accept(bufnr)
+end
+
+--- Reject the current prediction
+function M.reject()
+  local bufnr = vim.api.nvim_get_current_buf()
+  engine.reject(bufnr)
+end
+
+--- Manually trigger a prediction
+function M.trigger()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ft = vim.bo[bufnr].filetype
+
+  if not config.is_filetype_enabled(ft) then
+    log.debug("Filetype not enabled: " .. ft)
+    return
+  end
+
+  engine.trigger_now(bufnr)
+end
+
+--- Enable blink-edit
+function M.enable()
+  vim.g.blink_edit_enabled = true
+  log.info("Enabled")
+end
+
+--- Disable blink-edit
+function M.disable()
+  vim.g.blink_edit_enabled = false
+  M.reject()
+  log.info("Disabled")
+end
+
+--- Toggle blink-edit
+function M.toggle()
+  if vim.g.blink_edit_enabled == false then
+    M.enable()
+  else
+    M.disable()
+  end
+end
+
+--- Get current status
+---@return table
+function M.status()
+  local cfg = config.get()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local buf_state = state.get_state(bufnr)
+
+  return {
+    initialized = initialized,
+    enabled = vim.g.blink_edit_enabled ~= false,
+    mode = cfg.mode,
+    backend = cfg.llm.backend,
+    provider = cfg.llm.provider,
+    url = cfg.llm.url,
+    model = cfg.llm.model,
+    temperature = cfg.llm.temperature,
+    max_tokens = cfg.llm.max_tokens,
+    has_prediction = M.has_prediction(),
+    tracked_buffers = state.get_tracked_buffers(),
+    history_count = state.get_history_count(bufnr),
+    has_baseline = buf_state and buf_state.baseline ~= nil,
+    is_in_flight = state.is_in_flight(bufnr),
+    has_pending_snapshot = state.has_pending_snapshot(bufnr),
+  }
+end
+
+--- Health check (backend ping)
+function M.health_check()
+  local cfg = config.get()
+  local backend = require("blink-edit.backends")
+
+  backend.health_check(function(available, message)
+    local prefix = string.format("%s", cfg.llm.backend)
+    if available then
+      log.debug(prefix .. " backend healthy: " .. message)
+    else
+      log.debug(prefix .. " backend unhealthy: " .. message, vim.log.levels.WARN)
+    end
+  end)
+end
+
+--- Reset blink-edit (for testing/reconfiguration)
+function M.reset()
+  -- Clear autocmds
+  pcall(vim.api.nvim_del_augroup_by_name, "BlinkEdit")
+
+  -- Cleanup engine
+  engine.cleanup()
+
+  -- Reset config
+  config.reset()
+
+  -- Close transport connections
+  transport.close_all()
+
+  initialized = false
+
+  if vim.g.blink_edit_debug then
+    log.debug("Reset complete", vim.log.levels.INFO)
+  end
+end
+
+--- Check if plugin is initialized (for pre-setup commands)
+---@return boolean
+function M._is_initialized()
+  return initialized
+end
+
+--- Health check (for :checkhealth)
+function M.health()
+  local health = vim.health or require("health")
+  local start = health.start or health.report_start
+  local ok = health.ok or health.report_ok
+  local warn = health.warn or health.report_warn
+  local error_fn = health.error or health.report_error
+
+  start("blink-edit")
+
+  -- Check initialization
+  if initialized then
+    ok("Plugin initialized")
+  else
+    warn("Plugin not initialized, call setup()")
+  end
+
+  -- Check configuration
+  local cfg = config.get()
+  ok(string.format("Mode: %s", cfg.mode))
+  ok(string.format("Backend: %s", cfg.llm.backend))
+  ok(string.format("Provider: %s", cfg.llm.provider))
+  ok(string.format("URL: %s", cfg.llm.url))
+  ok(string.format("Model: %s", cfg.llm.model))
+
+  -- Check curl availability
+  if vim.fn.executable("curl") == 1 then
+    ok("curl is available")
+  else
+    error_fn("curl not found (required for HTTPS)")
+  end
+
+  -- Check Neovim version
+  if vim.fn.has("nvim-0.9") == 1 then
+    ok("Neovim 0.9+ detected")
+  else
+    warn("Neovim 0.9+ recommended for best compatibility")
+  end
+
+  -- Check vim.diff availability
+  if vim.diff then
+    ok("vim.diff() available")
+  else
+    error_fn("vim.diff() not available (requires Neovim 0.9+)")
+  end
+end
+
+return M

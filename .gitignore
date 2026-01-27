@@ -39,3 +39,25 @@ luac.out
 *.x86_64
 *.hex
 
+# Test files
+test/
+
+# Python
+.venv/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# Editor
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+vim.yml
