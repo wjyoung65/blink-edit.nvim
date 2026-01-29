@@ -13,8 +13,15 @@ local state = require("blink-edit.core.state")
 local utils = require("blink-edit.utils")
 local log = require("blink-edit.log")
 
+local uv = vim.uv or vim.loop
+
 ---@type boolean
 local initialized = false
+local normal_mode_timer = nil
+local lsp_wrapped = false
+local original_hover = nil
+local original_signature = nil
+local original_diag_open_float = nil
 
 --- Setup blink-edit with user configuration
 ---@param user_config? table
@@ -38,6 +45,9 @@ function M.setup(user_config)
 
   -- Setup keymaps
   M._setup_keymaps()
+
+  -- Setup LSP float suppression (optional)
+  M._setup_lsp_suppression()
 
   -- Setup autocmds
   M._setup_autocmds()
@@ -75,37 +85,50 @@ function M._setup_highlights()
   vim.api.nvim_set_hl(0, "BlinkEditAddition", cfg.highlight.addition)
   vim.api.nvim_set_hl(0, "BlinkEditDeletion", cfg.highlight.deletion)
   vim.api.nvim_set_hl(0, "BlinkEditPreview", cfg.highlight.preview)
+  vim.api.nvim_set_hl(0, "BlinkEditJump", cfg.highlight.jump)
+end
+
+--- Check if any completion plugin menu is visible
+---@return boolean
+function M._completion_menu_visible()
+  if package.loaded["blink.cmp"] then
+    local ok, blink_cmp = pcall(require, "blink.cmp")
+    if ok and blink_cmp.is_visible and blink_cmp.is_visible() then
+      return true
+    end
+  end
+
+  if package.loaded["cmp"] then
+    local ok, cmp = pcall(require, "cmp")
+    if ok and cmp.visible() then
+      return true
+    end
+  end
+
+  return false
 end
 
 --- Setup keymaps for accepting/rejecting predictions
 function M._setup_keymaps()
   local cfg = config.get()
 
-  -- Accept prediction with Tab (only when prediction visible)
+  -- Accept prediction with Tab
   -- Uses vim.schedule() to defer buffer modification outside textlock
   vim.keymap.set("i", cfg.accept_key, function()
-    -- Let completion engines handle Tab when menu is visible
-    if package.loaded["blink.cmp"] then
-      local ok, blink_cmp = pcall(require, "blink.cmp")
-      if ok and blink_cmp.is_visible and blink_cmp.is_visible() then
-        return cfg.accept_key
-      end
-    end
-
-    if package.loaded["cmp"] then
-      local ok, cmp = pcall(require, "cmp")
-      if ok and cmp.visible() then
-        return cfg.accept_key
-      end
-    end
-
+    -- Priority 1: Accept our prediction
     if M.has_prediction() then
       vim.schedule(function()
         M.accept()
       end)
-      return "" -- Consume the key, prevents fallback to other handlers
+      return ""
     end
-    -- Fall through to default Tab behavior (e.g., blink.cmp)
+
+    -- Priority 2: Let completion plugins handle Tab
+    if M._completion_menu_visible() then
+      return cfg.accept_key
+    end
+
+    -- Default: Insert Tab
     return cfg.accept_key
   end, { expr = true, noremap = true, desc = "Accept blink-edit prediction" })
 
@@ -123,6 +146,81 @@ function M._setup_keymaps()
   end, { expr = true, noremap = true, desc = "Reject blink-edit prediction" })
 end
 
+local function cancel_normal_mode_timer()
+  if normal_mode_timer and not normal_mode_timer:is_closing() then
+    normal_mode_timer:stop()
+    normal_mode_timer:close()
+  end
+  normal_mode_timer = nil
+end
+
+local function start_normal_mode_timer(bufnr)
+  local cfg = config.get()
+  if not cfg.normal_mode or not cfg.normal_mode.enabled then
+    return
+  end
+  cancel_normal_mode_timer()
+  local timer = uv.new_timer()
+  normal_mode_timer = timer
+  timer:start(cfg.debounce_ms, 0, function()
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    normal_mode_timer = nil
+    vim.schedule(function()
+      if not cfg.normal_mode or not cfg.normal_mode.enabled then
+        return
+      end
+      if M.has_prediction() then
+        return
+      end
+      engine.trigger_force(bufnr)
+    end)
+  end)
+end
+
+function M._setup_lsp_suppression()
+  if lsp_wrapped then
+    return
+  end
+  lsp_wrapped = true
+
+  original_hover = vim.lsp.handlers["textDocument/hover"]
+  original_signature = vim.lsp.handlers["textDocument/signatureHelp"]
+  original_diag_open_float = vim.diagnostic.open_float
+
+  vim.lsp.handlers["textDocument/hover"] = function(err, result, ctx, handler_config)
+    local cfg = config.get()
+    if cfg.ui and cfg.ui.suppress_lsp_floats and M.has_prediction() then
+      return
+    end
+    if original_hover then
+      return original_hover(err, result, ctx, handler_config)
+    end
+  end
+
+  vim.lsp.handlers["textDocument/signatureHelp"] = function(err, result, ctx, handler_config)
+    local cfg = config.get()
+    if cfg.ui and cfg.ui.suppress_lsp_floats and M.has_prediction() then
+      return
+    end
+    if original_signature then
+      return original_signature(err, result, ctx, handler_config)
+    end
+  end
+
+  vim.diagnostic.open_float = function(...)
+    local cfg = config.get()
+    if cfg.ui and cfg.ui.suppress_lsp_floats and M.has_prediction() then
+      return
+    end
+    if original_diag_open_float then
+      return original_diag_open_float(...)
+    end
+  end
+end
+
 --- Setup autocmds for triggering predictions
 function M._setup_autocmds()
   local augroup = vim.api.nvim_create_augroup("BlinkEdit", { clear = true })
@@ -131,6 +229,7 @@ function M._setup_autocmds()
   vim.api.nvim_create_autocmd("InsertEnter", {
     group = augroup,
     callback = function(args)
+      cancel_normal_mode_timer()
       engine.on_insert_enter(args.buf)
     end,
     desc = "Capture baseline for blink-edit on insert enter",
@@ -158,15 +257,26 @@ function M._setup_autocmds()
   vim.api.nvim_create_autocmd("InsertLeave", {
     group = augroup,
     callback = function(args)
+      cancel_normal_mode_timer()
       engine.on_insert_leave(args.buf)
     end,
     desc = "Cleanup blink-edit on insert leave",
+  })
+
+  -- Normal mode idle trigger
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = augroup,
+    callback = function(args)
+      M._on_cursor_moved_normal(args.buf)
+    end,
+    desc = "Handle normal-mode idle triggers for blink-edit",
   })
 
   -- Clear prediction on buffer leave
   vim.api.nvim_create_autocmd("BufLeave", {
     group = augroup,
     callback = function(args)
+      cancel_normal_mode_timer()
       engine.cancel(args.buf)
     end,
     desc = "Cancel blink-edit on buffer leave",
@@ -258,6 +368,13 @@ function M._on_text_changed(bufnr)
     return
   end
 
+  cancel_normal_mode_timer()
+  engine.cancel_prefetch(bufnr)
+
+  if state.consume_suppress_trigger(bufnr) then
+    return
+  end
+
   -- Skip special buffer types
   local buftype = vim.bo[bufnr].buftype
   if buftype ~= "" then
@@ -283,6 +400,49 @@ end
 ---@param bufnr number
 function M._on_cursor_moved(bufnr)
   engine.on_cursor_moved(bufnr)
+end
+
+--- Called on cursor move in normal mode
+---@param bufnr number
+function M._on_cursor_moved_normal(bufnr)
+  local cfg = config.get()
+  if not cfg.normal_mode or not cfg.normal_mode.enabled then
+    return
+  end
+
+  if vim.g.blink_edit_enabled == false then
+    return
+  end
+
+  engine.cancel_prefetch(bufnr)
+
+  if M.has_prediction() then
+    return
+  end
+
+  local mode = vim.api.nvim_get_mode().mode
+  if mode ~= "n" then
+    return
+  end
+
+  -- Skip special buffer types
+  local buftype = vim.bo[bufnr].buftype
+  if buftype ~= "" then
+    return
+  end
+
+  -- Skip read-only or unmodifiable buffers
+  if vim.bo[bufnr].readonly or not vim.bo[bufnr].modifiable then
+    return
+  end
+
+  -- Check if filetype is enabled
+  local ft = vim.bo[bufnr].filetype
+  if not config.is_filetype_enabled(ft) then
+    return
+  end
+
+  start_normal_mode_timer(bufnr)
 end
 
 --- Check if there's an active prediction
@@ -326,6 +486,7 @@ end
 --- Disable blink-edit
 function M.disable()
   vim.g.blink_edit_enabled = false
+  cancel_normal_mode_timer()
   M.reject()
   log.info("Disabled")
 end

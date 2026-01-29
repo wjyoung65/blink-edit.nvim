@@ -214,6 +214,38 @@ local function setup_highlights()
 end
 
 -- =============================================================================
+-- LSP Float Suppression
+-- =============================================================================
+
+--- Close active LSP-related floating windows
+function M.close_lsp_floats()
+  local cfg = config.get()
+  if not cfg.ui or cfg.ui.suppress_lsp_floats ~= true then
+    return
+  end
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) then
+      local win_cfg = vim.api.nvim_win_get_config(win)
+      if win_cfg and win_cfg.relative ~= "" then
+        local is_lsp = false
+        local ok_preview, preview = pcall(vim.api.nvim_win_get_var, win, "lsp_floating_preview")
+        if ok_preview and preview then
+          is_lsp = true
+        end
+        local ok_diag = pcall(vim.api.nvim_win_get_var, win, "diagnostic")
+        if ok_diag then
+          is_lsp = true
+        end
+        if is_lsp then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+    end
+  end
+end
+
+-- =============================================================================
 -- Helper Functions
 -- =============================================================================
 

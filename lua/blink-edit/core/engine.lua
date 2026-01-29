@@ -16,6 +16,8 @@ local ui = require("blink-edit.ui")
 
 local uv = vim.uv or vim.loop
 
+local MAX_INVALID_RETRIES = 1
+
 ---@class DebounceTimer
 ---@field timer userdata|nil
 ---@field bufnr number
@@ -25,6 +27,8 @@ local debounce_timers = {}
 
 -- Provider cache
 local provider_cache = {}
+
+local merge_completion
 
 -- =============================================================================
 -- Provider Management
@@ -90,6 +94,394 @@ local function cancel_debounce(bufnr)
   debounce_timers[bufnr] = nil
 end
 
+local function cancel_prefetch(bufnr)
+  local prefetch = state.get_prefetch(bufnr)
+  if prefetch and prefetch.request_id then
+    transport.cancel(prefetch.request_id)
+  end
+  state.clear_prefetch(bufnr)
+end
+
+-- =============================================================================
+-- Hunk Helpers
+-- =============================================================================
+
+---@param snapshot BlinkEditSnapshot
+---@return string
+local function fingerprint_snapshot(snapshot)
+  local first = snapshot.lines and snapshot.lines[1] or ""
+  local last = snapshot.lines and snapshot.lines[#snapshot.lines] or ""
+  return table.concat({
+    tostring(snapshot.window_start or 0),
+    tostring(snapshot.window_end or 0),
+    tostring(snapshot.cursor and snapshot.cursor[1] or 0),
+    tostring(snapshot.cursor and snapshot.cursor[2] or 0),
+    tostring(snapshot.lines and #snapshot.lines or 0),
+    first,
+    last,
+  }, "|")
+end
+
+---@param lines string[]
+---@param target string
+---@return number|nil
+local function find_line_index(lines, target)
+  if not target or target == "" then
+    return nil
+  end
+  for i, line in ipairs(lines or {}) do
+    if line == target then
+      return i
+    end
+  end
+  return nil
+end
+
+--- Count leading empty/whitespace lines
+---@param lines string[]
+---@return number
+local function count_leading_blank(lines)
+  local count = 0
+  for _, line in ipairs(lines or {}) do
+    if line:match("%S") then
+      break
+    end
+    count = count + 1
+  end
+  return count
+end
+
+--- Get first non-empty line
+---@param lines string[]
+---@return string|nil, number|nil
+local function get_first_non_empty(lines)
+  for i, line in ipairs(lines or {}) do
+    if line:match("%S") then
+      return line, i
+    end
+  end
+  return nil, nil
+end
+
+--- Count trailing empty/whitespace lines
+---@param lines string[]
+---@return number
+local function count_trailing_blank(lines)
+  local count = 0
+  for i = #(lines or {}), 1, -1 do
+    if lines[i]:match("%S") then
+      break
+    end
+    count = count + 1
+  end
+  return count
+end
+
+--- Get first N consecutive non-empty lines
+---@param lines string[]
+---@param count number
+---@return string[]|nil anchor_lines, number|nil start_index (1-indexed)
+local function get_first_consecutive_non_empty(lines, count)
+  if not lines or #lines < count then
+    return nil, nil
+  end
+
+  for i = 1, #lines - count + 1 do
+    local all_non_empty = true
+    for j = 0, count - 1 do
+      if not lines[i + j]:match("%S") then
+        all_non_empty = false
+        break
+      end
+    end
+    if all_non_empty then
+      local result = {}
+      for j = 0, count - 1 do
+        table.insert(result, lines[i + j])
+      end
+      return result, i
+    end
+  end
+
+  return nil, nil
+end
+
+--- Find where needle (consecutive lines) appears in haystack
+---@param haystack string[]
+---@param needle string[]
+---@return number|nil match_index (1-indexed)
+local function find_consecutive_match(haystack, needle)
+  if not haystack or not needle or #needle == 0 then
+    return nil
+  end
+  if #haystack < #needle then
+    return nil
+  end
+
+  for i = 1, #haystack - #needle + 1 do
+    local match = true
+    for j = 1, #needle do
+      if haystack[i + j - 1] ~= needle[j] then
+        match = false
+        break
+      end
+    end
+    if match then
+      return i
+    end
+  end
+
+  return nil
+end
+
+--- Extract a slice of lines (1-indexed, inclusive)
+---@param lines string[]
+---@param start_idx number
+---@param end_idx number|nil (nil = to end)
+---@return string[]
+local function slice_lines(lines, start_idx, end_idx)
+  local result = {}
+  end_idx = end_idx or #lines
+  for i = start_idx, math.min(end_idx, #lines) do
+    table.insert(result, lines[i])
+  end
+  return result
+end
+
+--- Attempt to realign a shifted/partial prediction with the snapshot
+--- Handles: excess leading blanks, excess trailing blanks, suffix-only responses
+---@param snapshot_lines string[]
+---@param predicted_lines string[]
+---@return string[]|nil realigned_lines
+local function try_realign_prediction(snapshot_lines, predicted_lines)
+  if not snapshot_lines or not predicted_lines or #predicted_lines == 0 then
+    return nil
+  end
+
+  -- Work with a copy
+  local result = {}
+  for _, line in ipairs(predicted_lines) do
+    table.insert(result, line)
+  end
+
+  local changed = false
+
+  -- Step 1: Strip excess leading blanks
+  local snapshot_leading = count_leading_blank(snapshot_lines)
+  local predicted_leading = count_leading_blank(result)
+  if predicted_leading > snapshot_leading then
+    local excess = predicted_leading - snapshot_leading
+    result = slice_lines(result, excess + 1, nil)
+    changed = true
+    if vim.g.blink_edit_debug and vim.g.blink_edit_debug >= 2 then
+      log.debug2(string.format("Realign: stripped %d leading blanks", excess))
+    end
+  end
+
+  -- Step 2: Strip excess trailing blanks
+  local snapshot_trailing = count_trailing_blank(snapshot_lines)
+  local predicted_trailing = count_trailing_blank(result)
+  if predicted_trailing > snapshot_trailing then
+    local excess = predicted_trailing - snapshot_trailing
+    result = slice_lines(result, 1, #result - excess)
+    changed = true
+    if vim.g.blink_edit_debug and vim.g.blink_edit_debug >= 2 then
+      log.debug2(string.format("Realign: stripped %d trailing blanks", excess))
+    end
+  end
+
+  -- Step 3: If still shorter than snapshot, try anchor alignment
+  if #result < #snapshot_lines then
+    local anchor, anchor_idx = get_first_consecutive_non_empty(result, 2)
+    if anchor then
+      local match_idx = find_consecutive_match(snapshot_lines, anchor)
+      if match_idx and match_idx > 1 then
+        -- Prepend snapshot prefix
+        local prefix = slice_lines(snapshot_lines, 1, match_idx - 1)
+        local new_result = {}
+        for _, line in ipairs(prefix) do
+          table.insert(new_result, line)
+        end
+        for _, line in ipairs(result) do
+          table.insert(new_result, line)
+        end
+        result = new_result
+        changed = true
+        if vim.g.blink_edit_debug and vim.g.blink_edit_debug >= 2 then
+          log.debug2(string.format("Realign: prepended %d lines (anchor at snapshot line %d)", #prefix, match_idx))
+        end
+      end
+    end
+  end
+
+  if not changed then
+    if vim.g.blink_edit_debug and vim.g.blink_edit_debug >= 2 then
+      log.debug2("Realign: no adjustment needed")
+    end
+  end
+
+  return result
+end
+
+---@param snapshot_lines string[]
+---@param predicted_lines string[]
+---@return boolean invalid, string|nil reason
+local function is_invalid_prediction(snapshot_lines, predicted_lines)
+  if not snapshot_lines or not predicted_lines then
+    return false, nil
+  end
+
+  local snapshot_len = #snapshot_lines
+  local predicted_len = #predicted_lines
+
+  -- Check if prediction is all empty/whitespace
+  local first_non_empty, first_idx = get_first_non_empty(predicted_lines)
+  if not first_non_empty then
+    return true, "all_empty"
+  end
+
+  -- Check leading blank mismatch
+  local snapshot_leading = count_leading_blank(snapshot_lines)
+  local predicted_leading = count_leading_blank(predicted_lines)
+  if predicted_leading > snapshot_leading + 1 then
+    return true, "leading_blank_mismatch"
+  end
+
+  -- Use first non-empty line as anchor instead of first line
+  if snapshot_len > 10 and first_non_empty then
+    local anchor = find_line_index(snapshot_lines, first_non_empty)
+    if anchor and anchor > math.floor(snapshot_len / 4) then
+      return true, "anchor_too_far"
+    end
+  end
+
+  return false, nil
+end
+
+--- Check if two line arrays differ only in trailing empty/whitespace lines
+---@param snapshot_lines string[]
+---@param predicted_lines string[]
+---@return boolean
+local function is_only_trailing_whitespace_change(snapshot_lines, predicted_lines)
+  if not snapshot_lines or not predicted_lines then
+    return false
+  end
+
+  -- Strip trailing empty/whitespace lines from both
+  local function strip_trailing(lines)
+    local result = {}
+    local last_non_empty = 0
+    for i, line in ipairs(lines) do
+      if line:match("%S") then
+        last_non_empty = i
+      end
+    end
+    for i = 1, last_non_empty do
+      result[i] = lines[i]
+    end
+    return result
+  end
+
+  local stripped_snapshot = strip_trailing(snapshot_lines)
+  local stripped_predicted = strip_trailing(predicted_lines)
+
+  if #stripped_snapshot ~= #stripped_predicted then
+    return false
+  end
+
+  for i = 1, #stripped_snapshot do
+    if stripped_snapshot[i] ~= stripped_predicted[i] then
+      return false
+    end
+  end
+
+  -- If we get here, the non-trailing content is identical
+  -- so the only changes are trailing whitespace
+  return true
+end
+
+---@param window_start number
+---@param cursor { [1]: number, [2]: number }|nil
+---@return number
+local function get_cursor_offset(window_start, cursor)
+  local cursor_offset = 1
+  if cursor then
+    cursor_offset = cursor[1] - window_start + 1
+    cursor_offset = math.max(1, cursor_offset)
+  end
+  return cursor_offset
+end
+
+---@param hunks DiffHunk[]
+---@param cursor_offset number
+---@return DiffHunk|nil
+local function find_next_hunk(hunks, cursor_offset)
+  for _, hunk in ipairs(hunks or {}) do
+    if hunk.start_old >= cursor_offset then
+      return hunk
+    end
+  end
+  return nil
+end
+
+---@param lines string[]
+---@param hunk DiffHunk
+---@return string[]
+local function apply_hunk_lines(lines, hunk)
+  local result = {}
+
+  local before_end
+  if hunk.count_old == 0 then
+    before_end = hunk.start_old
+  else
+    before_end = hunk.start_old - 1
+  end
+  before_end = math.max(before_end, 0)
+
+  for i = 1, math.min(before_end, #lines) do
+    table.insert(result, lines[i])
+  end
+
+  for _, line in ipairs(hunk.new_lines or {}) do
+    table.insert(result, line)
+  end
+
+  local after_start
+  if hunk.count_old == 0 then
+    after_start = hunk.start_old + 1
+  else
+    after_start = hunk.start_old + hunk.count_old
+  end
+  after_start = math.max(after_start, 1)
+
+  for i = after_start, #lines do
+    table.insert(result, lines[i])
+  end
+
+  return result
+end
+
+---@param hunk DiffHunk
+---@param window_start number
+---@param lines string[]
+---@return number, number
+local function compute_hunk_end_cursor(hunk, window_start, lines)
+  local end_line
+  local end_col
+
+  if hunk.count_new == 0 or hunk.type == "deletion" then
+    end_line = window_start + hunk.start_new - 1
+    end_col = 0
+  else
+    local hunk_end = hunk.start_new + hunk.count_new - 1
+    hunk_end = math.max(1, math.min(hunk_end, #lines))
+    end_line = window_start + hunk_end - 1
+    end_col = #(lines[hunk_end] or "")
+  end
+
+  return end_line, end_col
+end
+
 -- =============================================================================
 -- Request Lifecycle
 -- =============================================================================
@@ -114,8 +506,21 @@ local function start_request(bufnr, snapshot)
     end
   end
 
+  local force_request = snapshot.force_request == true
+
+  if vim.g.blink_edit_debug then
+    log.debug(
+      string.format(
+        "start_request: force=%s window=%d-%d",
+        tostring(force_request),
+        snapshot.window_start or -1,
+        snapshot.window_end or -1
+      )
+    )
+  end
+
   -- Skip if nothing changed from baseline (no edit to predict)
-  if utils.lines_equal(baseline.lines, snapshot.lines) then
+  if not force_request and utils.lines_equal(baseline.lines, snapshot.lines) then
     if vim.g.blink_edit_debug then
       log.debug("Skipping request: no changes from baseline")
     end
@@ -187,6 +592,167 @@ local function start_request(bufnr, snapshot)
 
   -- Show progress indicator
   ui.show_progress()
+end
+
+local function on_prefetch_response(bufnr, err, result, metadata, snapshot, provider, request_id)
+  local prefetch = state.get_prefetch(bufnr)
+  if not prefetch or prefetch.request_id ~= request_id then
+    return
+  end
+
+  prefetch.in_flight = false
+
+  if err or not result or not result.text then
+    state.clear_prefetch(bufnr)
+    return
+  end
+
+  local cfg = config.get()
+
+  local predicted_lines, parse_err = provider:parse_response(result.text, snapshot.lines)
+  if not predicted_lines then
+    if vim.g.blink_edit_debug then
+      log.debug("Prefetch invalid response: " .. (parse_err or "unknown"))
+    end
+    state.clear_prefetch(bufnr)
+    return
+  end
+
+  -- Try to realign shifted/partial responses
+  local realigned = try_realign_prediction(snapshot.lines, predicted_lines)
+  if realigned then
+    predicted_lines = realigned
+  end
+
+  local cursor_after = nil
+  if cfg.mode == "completion" then
+    local merged, after, merge_err = merge_completion(snapshot, predicted_lines)
+    if not merged then
+      if vim.g.blink_edit_debug then
+        log.debug("Prefetch invalid completion: " .. (merge_err or "unknown"))
+      end
+      state.clear_prefetch(bufnr)
+      return
+    end
+    predicted_lines = merged
+    cursor_after = after
+  end
+
+  if cfg.mode ~= "completion" then
+    local invalid = is_invalid_prediction(snapshot.lines, predicted_lines)
+    if invalid then
+      state.clear_prefetch(bufnr)
+      return
+    end
+  end
+
+  local has_changes = false
+  if #predicted_lines ~= #snapshot.lines then
+    has_changes = true
+  else
+    for i = 1, #predicted_lines do
+      if predicted_lines[i] ~= snapshot.lines[i] then
+        has_changes = true
+        break
+      end
+    end
+  end
+
+  if not has_changes then
+    state.clear_prefetch(bufnr)
+    return
+  end
+
+  -- Discard if only trailing whitespace changed
+  if is_only_trailing_whitespace_change(snapshot.lines, predicted_lines) then
+    state.clear_prefetch(bufnr)
+    return
+  end
+
+  prefetch.prediction = {
+    predicted_lines = predicted_lines,
+    snapshot_lines = snapshot.lines,
+    window_start = metadata.window_start,
+    window_end = metadata.window_end,
+    response_text = result.text,
+    created_at = uv.now(),
+    cursor_after = cursor_after,
+    cursor = snapshot.cursor,
+  }
+
+  state.set_prefetch(bufnr, prefetch)
+end
+
+local function start_prefetch_request(bufnr, snapshot)
+  local cfg = config.get()
+  if not cfg.prefetch or not cfg.prefetch.enabled then
+    return
+  end
+
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  if state.is_in_flight(bufnr) then
+    return
+  end
+
+  local existing = state.get_prefetch(bufnr)
+  if existing and existing.in_flight then
+    return
+  end
+
+  local baseline = state.get_baseline(bufnr)
+  if not baseline then
+    state.capture_baseline(bufnr)
+    baseline = state.get_baseline(bufnr)
+    if not baseline then
+      return
+    end
+  end
+
+  local provider = get_provider()
+  local requirements = provider:get_requirements()
+
+  local limits = {
+    max_history_tokens = cfg.context.history.max_tokens,
+    max_context_tokens = cfg.context.max_tokens,
+    max_history_entries = cfg.context.history.max_items,
+    max_files = cfg.context.history.max_files,
+  }
+
+  local context_data = context_manager.collect(bufnr, baseline, snapshot, requirements, limits)
+  local prompt, metadata, build_err = provider:build_prompt(context_data, limits)
+  if not prompt or not metadata then
+    if vim.g.blink_edit_debug then
+      log.debug("Prefetch failed to build prompt: " .. (build_err or "unknown"))
+    end
+    return
+  end
+
+  if vim.g.blink_edit_debug and vim.g.blink_edit_debug >= 2 then
+    log.debug2("=== PREFETCH PROMPT ===\n" .. prompt .. "\n=== END PREFETCH PROMPT ===")
+  end
+
+  local stop_tokens = provider:get_stop_tokens()
+  local request_id = backend.complete({
+    prompt = prompt,
+    model = cfg.llm.model,
+    max_tokens = cfg.llm.max_tokens,
+    temperature = cfg.llm.temperature,
+    stop = stop_tokens,
+  }, function(err, result)
+    vim.schedule(function()
+      on_prefetch_response(bufnr, err, result, metadata, snapshot, provider, request_id)
+    end)
+  end)
+
+  state.set_prefetch(bufnr, {
+    request_id = request_id,
+    snapshot = snapshot,
+    created_at = uv.now(),
+    in_flight = true,
+  })
 end
 
 --- Handle response from LLM
@@ -267,6 +833,12 @@ function on_response(bufnr, err, result, metadata, snapshot, provider)
     return
   end
 
+  -- Try to realign shifted/partial responses
+  local realigned = try_realign_prediction(snapshot.lines, predicted_lines)
+  if realigned then
+    predicted_lines = realigned
+  end
+
   local cursor_after = nil
   if cfg.mode == "completion" then
     local merged, after, merge_err = merge_completion(snapshot, predicted_lines)
@@ -278,6 +850,25 @@ function on_response(bufnr, err, result, metadata, snapshot, provider)
     end
     predicted_lines = merged
     cursor_after = after
+  end
+
+  local allow_fallback = false
+  if cfg.mode ~= "completion" then
+    local invalid, reason = is_invalid_prediction(snapshot.lines, predicted_lines)
+    if invalid then
+      local fingerprint = fingerprint_snapshot(snapshot)
+      local count = state.bump_invalid_response(bufnr, fingerprint)
+      if vim.g.blink_edit_debug then
+        log.debug(string.format("Invalid prediction (%s), retry=%d", tostring(reason), count))
+      end
+      if count <= MAX_INVALID_RETRIES then
+        M.trigger_force(bufnr)
+        return
+      end
+      allow_fallback = true
+    else
+      state.clear_invalid_response(bufnr)
+    end
   end
 
   -- Check if prediction is same as current (no changes)
@@ -300,6 +891,16 @@ function on_response(bufnr, err, result, metadata, snapshot, provider)
     return
   end
 
+  -- Discard if only trailing whitespace changed
+  if is_only_trailing_whitespace_change(snapshot.lines, predicted_lines) then
+    if vim.g.blink_edit_debug then
+      log.debug("Discarding prediction: only trailing whitespace changes")
+    end
+    return
+  end
+
+  cancel_prefetch(bufnr)
+
   -- Store prediction with snapshot and predicted lines
   local prediction = {
     predicted_lines = predicted_lines,
@@ -310,10 +911,15 @@ function on_response(bufnr, err, result, metadata, snapshot, provider)
     created_at = uv.now(),
     cursor_after = cursor_after,
     cursor = snapshot.cursor, -- Cursor position when prediction was made
+    allow_fallback = allow_fallback,
   }
+  if allow_fallback then
+    state.clear_invalid_response(bufnr)
+  end
   state.set_prediction(bufnr, prediction)
 
   -- Render ghost text
+  ui.close_lsp_floats()
   render.show(bufnr, prediction)
 
   if vim.g.blink_edit_debug then
@@ -329,7 +935,7 @@ end
 ---@return string[]|nil merged
 ---@return table|nil cursor_after
 ---@return string|nil error
-local function merge_completion(snapshot, completion_lines)
+merge_completion = function(snapshot, completion_lines)
   if not completion_lines or #completion_lines == 0 then
     return nil, nil, "empty completion"
   end
@@ -386,6 +992,8 @@ end
 function M.trigger(bufnr)
   local cfg = config.get()
 
+  cancel_prefetch(bufnr)
+
   -- Cancel existing debounce timer
   cancel_debounce(bufnr)
 
@@ -430,8 +1038,10 @@ end
 
 --- Called when debounce timer fires
 ---@param bufnr number
-function M._on_debounce_fired(bufnr)
+---@param opts? { force_request?: boolean }
+function M._on_debounce_fired(bufnr, opts)
   local cfg = config.get()
+  local force_request = opts and opts.force_request
 
   -- Check if buffer is still valid
   if not vim.api.nvim_buf_is_valid(bufnr) then
@@ -443,6 +1053,14 @@ function M._on_debounce_fired(bufnr)
 
   -- 2. Capture snapshot (current state)
   local snapshot = state.capture_snapshot(bufnr)
+  if snapshot and force_request then
+    snapshot.force_request = true
+  end
+
+  if vim.g.blink_edit_debug then
+    local line_count = snapshot and snapshot.lines and #snapshot.lines or 0
+    log.debug(string.format("Debounce fired (force=%s, snapshot_lines=%d)", tostring(force_request), line_count))
+  end
 
   -- 3. Push to stack (replaces any existing)
   state.push_to_stack(bufnr, snapshot)
@@ -501,11 +1119,45 @@ function M.trigger_now(bufnr)
   M._on_debounce_fired(bufnr)
 end
 
+--- Trigger a prediction immediately (force request)
+---@param bufnr number
+function M.trigger_force(bufnr)
+  -- Cancel any existing debounce
+  cancel_debounce(bufnr)
+
+  cancel_prefetch(bufnr)
+
+  -- Check if buffer is valid
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  -- Check if plugin is enabled
+  if vim.g.blink_edit_enabled == false then
+    return
+  end
+
+  if vim.g.blink_edit_debug then
+    log.debug(
+      string.format(
+        "Force trigger requested (in_flight=%s, pending=%s)",
+        tostring(state.is_in_flight(bufnr)),
+        tostring(state.has_pending_snapshot(bufnr))
+      )
+    )
+  end
+
+  -- Directly fire the debounce logic (force request)
+  M._on_debounce_fired(bufnr, { force_request = true })
+end
+
 --- Cancel pending request for a buffer
 ---@param bufnr number
 function M.cancel(bufnr)
   -- Cancel debounce timer
   cancel_debounce(bufnr)
+
+  cancel_prefetch(bufnr)
 
   -- Cancel in-flight request
   local request_id = state.get_in_flight_request_id(bufnr)
@@ -519,6 +1171,12 @@ function M.cancel(bufnr)
   render.clear(bufnr)
 end
 
+--- Cancel any prefetch request for a buffer
+---@param bufnr number
+function M.cancel_prefetch(bufnr)
+  cancel_prefetch(bufnr)
+end
+
 --- Accept the current prediction
 ---@param bufnr number
 ---@return boolean success
@@ -528,30 +1186,78 @@ function M.accept(bufnr)
     return false
   end
 
-  -- Apply the prediction (replaces window with predicted content)
-  local success, merged_lines = render.apply(bufnr)
+  local snapshot_lines = prediction.snapshot_lines
+  local predicted_lines = prediction.predicted_lines
+  local window_start = prediction.window_start
+
+  if not snapshot_lines or not predicted_lines then
+    return false
+  end
+
+  local cursor_offset = get_cursor_offset(window_start, prediction.cursor)
+  local diff_result = diff.compute(snapshot_lines, predicted_lines)
+
+  if not diff_result.has_changes or #diff_result.hunks == 0 then
+    if vim.g.blink_edit_debug then
+      log.debug("Accept: no diff hunks, nothing to apply")
+    end
+    render.clear(bufnr)
+    state.clear_selection(bufnr)
+    cancel_debounce(bufnr)
+    return false
+  end
+
+  local next_hunk = find_next_hunk(diff_result.hunks, cursor_offset)
+  if not next_hunk then
+    if prediction.allow_fallback and diff_result.hunks[1] then
+      if vim.g.blink_edit_debug then
+        log.debug("Accept fallback: applying first hunk above cursor")
+      end
+      next_hunk = diff_result.hunks[1]
+    else
+      if vim.g.blink_edit_debug then
+        log.debug("Accept: no hunk at/below cursor, forcing request")
+      end
+      render.clear(bufnr)
+      state.clear_selection(bufnr)
+      cancel_debounce(bufnr)
+      M.trigger_force(bufnr)
+      state.update_baseline(bufnr)
+      return false
+    end
+  end
+
+  -- Apply only the next hunk
+  state.set_suppress_trigger(bufnr, true)
+  local partial_predicted = apply_hunk_lines(snapshot_lines, next_hunk)
+  local partial_prediction = {
+    predicted_lines = partial_predicted,
+    snapshot_lines = snapshot_lines,
+    window_start = prediction.window_start,
+    window_end = prediction.window_end,
+    response_text = prediction.response_text,
+    created_at = prediction.created_at,
+    cursor = prediction.cursor,
+  }
+
+  local success, merged_lines = render.apply_with_prediction(bufnr, partial_prediction)
   if not success then
+    if vim.g.blink_edit_debug then
+      log.debug("Accept: partial apply failed")
+    end
+    state.set_suppress_trigger(bufnr, false)
     return false
   end
 
   local cfg = config.get()
   if cfg.context.enabled and cfg.context.history.enabled and cfg.llm.provider ~= "zeta" then
     -- Add per-hunk history from applied content
-    local window_start = prediction.window_start
-    local snapshot_lines = prediction.snapshot_lines
-    local applied_lines = merged_lines or prediction.predicted_lines
-
-    local cursor_offset = 1
-    if prediction.cursor then
-      cursor_offset = prediction.cursor[1] - window_start + 1
-      cursor_offset = math.max(1, cursor_offset)
-    end
-
+    local cursor_offset_history = cursor_offset
     local filepath = utils.normalize_filepath(vim.api.nvim_buf_get_name(bufnr))
 
-    local diff_result = diff.compute(snapshot_lines, applied_lines)
-    for _, hunk in ipairs(diff_result.hunks) do
-      if hunk.start_old >= cursor_offset then
+    local step_diff = diff.compute(snapshot_lines, merged_lines or partial_predicted)
+    for _, hunk in ipairs(step_diff.hunks) do
+      if hunk.start_old >= cursor_offset_history then
         local original_text = table.concat(hunk.old_lines or {}, "\n")
         local updated_text = table.concat(hunk.new_lines or {}, "\n")
 
@@ -575,80 +1281,10 @@ function M.accept(bufnr)
     end
   end
 
-  -- Clear prediction state (render.apply doesn't clear it so we can use it for cursor)
-  state.clear_prediction(bufnr)
+  -- Update prediction state for the remaining hunks
+  prediction.snapshot_lines = merged_lines or partial_predicted
 
-  -- Clear selection after accepting (user's intent fulfilled)
-  state.clear_selection(bufnr)
-
-  -- Update baseline (new starting point for next edit)
-  state.update_baseline(bufnr)
-
-  -- Cancel any pending debounce to prevent stale request from TextChangedI
-  cancel_debounce(bufnr)
-
-  -- Move cursor to end of last actual change
-  local predicted_lines = prediction.predicted_lines
-  local snapshot_lines = prediction.snapshot_lines
-  local window_start = prediction.window_start
-  local target_cursor = prediction.cursor_after
-  local end_line
-  local end_col
-
-  if target_cursor then
-    -- Completion mode: use pre-computed cursor position
-    end_line = target_cursor[1]
-    end_col = target_cursor[2]
-  else
-    -- Next-edit mode: find largest meaningful change at/below cursor and position at end of it
-    local diff_result = diff.compute(snapshot_lines, predicted_lines)
-
-    -- Calculate cursor offset in window (1-indexed)
-    local cursor_offset = 1
-    if prediction.cursor then
-      cursor_offset = prediction.cursor[1] - window_start + 1
-      cursor_offset = math.max(1, cursor_offset)
-    end
-
-    if diff_result.has_changes and #diff_result.hunks > 0 then
-      -- Find hunk with largest net addition, but ONLY consider hunks at/below cursor
-      local best_hunk = nil
-      local best_score = -999
-
-      for _, hunk in ipairs(diff_result.hunks) do
-        -- Only consider hunks at or below cursor (next-edit semantics)
-        if hunk.start_old >= cursor_offset then
-          local score = hunk.count_new - hunk.count_old
-          if score > best_score then
-            best_score = score
-            best_hunk = hunk
-          end
-        end
-      end
-
-      if best_hunk then
-        if best_hunk.type == "deletion" or best_hunk.count_new == 0 then
-          -- Deletion: position at line where deletion occurred
-          end_line = window_start + best_hunk.start_new - 1
-          end_col = 0
-        else
-          -- Has new content: end of that content
-          local hunk_end = best_hunk.start_new + best_hunk.count_new - 1
-          hunk_end = math.max(1, math.min(hunk_end, #predicted_lines))
-          end_line = window_start + hunk_end - 1
-          end_col = #(predicted_lines[hunk_end] or "")
-        end
-      else
-        -- No hunks at/below cursor, stay at cursor position
-        end_line = prediction.cursor[1]
-        end_col = prediction.cursor[2]
-      end
-    else
-      -- No changes detected, stay within original window bounds
-      end_line = window_start + #snapshot_lines - 1
-      end_col = #(snapshot_lines[#snapshot_lines] or "")
-    end
-  end
+  local end_line, end_col = compute_hunk_end_cursor(next_hunk, window_start, partial_predicted)
 
   -- Ensure line is valid
   local line_count = vim.api.nvim_buf_line_count(bufnr)
@@ -665,11 +1301,80 @@ function M.accept(bufnr)
   if end_col > #line_content then
     end_col = #line_content
   end
+  if end_col < 0 then
+    end_col = 0
+  end
 
   vim.api.nvim_win_set_cursor(0, { end_line, end_col })
+  prediction.cursor = { end_line, end_col }
+  state.set_prediction(bufnr, prediction)
+
+  -- Cancel any pending debounce to prevent stale request from TextChangedI
+  cancel_debounce(bufnr)
+
+  -- Check if more hunks remain at/below cursor
+  local remaining = diff.compute(prediction.snapshot_lines, prediction.predicted_lines)
+  local remaining_hunk = nil
+  local remaining_hunks = {}
+  if remaining.has_changes and #remaining.hunks > 0 then
+    local new_cursor_offset = get_cursor_offset(window_start, prediction.cursor)
+    for _, hunk in ipairs(remaining.hunks) do
+      if hunk.start_old >= new_cursor_offset then
+        table.insert(remaining_hunks, hunk)
+      end
+    end
+    remaining_hunk = remaining_hunks[1]
+  end
+
+  if cfg.prefetch and cfg.prefetch.enabled and cfg.prefetch.strategy == "n-1" then
+    if #remaining_hunks == 1 then
+      local target_hunk = remaining_hunks[1]
+      local end_line, end_col = compute_hunk_end_cursor(target_hunk, window_start, prediction.predicted_lines)
+      local prefetch_snapshot = {
+        lines = prediction.predicted_lines,
+        window_start = prediction.window_start,
+        window_end = prediction.window_end,
+        cursor = { end_line, end_col },
+        timestamp = uv.now(),
+        force_request = true,
+      }
+      start_prefetch_request(bufnr, prefetch_snapshot)
+    end
+  end
+
+  if remaining_hunk then
+    if vim.g.blink_edit_debug then
+      log.debug("Accept: remaining hunks, re-rendering")
+    end
+    render.show(bufnr, prediction)
+  else
+    if vim.g.blink_edit_debug then
+      log.debug("Accept: last hunk applied, forcing request")
+    end
+    render.clear(bufnr)
+    state.clear_selection(bufnr)
+    state.update_baseline(bufnr)
+
+    local prefetch = state.get_prefetch(bufnr)
+    if prefetch and prefetch.prediction and prefetch.snapshot then
+      local snapshot_match =
+        prefetch.snapshot.window_start == prediction.window_start
+        and prefetch.snapshot.window_end == prediction.window_end
+        and utils.lines_equal(prefetch.snapshot.lines, prediction.snapshot_lines)
+      if snapshot_match then
+        state.set_prediction(bufnr, prefetch.prediction)
+        state.clear_prefetch(bufnr)
+        render.show(bufnr, prefetch.prediction)
+        return true
+      end
+    end
+
+    cancel_prefetch(bufnr)
+    M.trigger_force(bufnr)
+  end
 
   if vim.g.blink_edit_debug then
-    log.debug(string.format("Accepted prediction, history=%d", state.get_history_count(bufnr)))
+    log.debug(string.format("Accepted hunk, history=%d", state.get_history_count(bufnr)))
   end
 
   return true
@@ -680,6 +1385,8 @@ end
 function M.reject(bufnr)
   -- Cancel debounce and in-flight
   cancel_debounce(bufnr)
+
+  cancel_prefetch(bufnr)
 
   local request_id = state.get_in_flight_request_id(bufnr)
   if request_id then
@@ -750,6 +1457,8 @@ function M.on_insert_leave(bufnr)
     transport.cancel(request_id)
     state.clear_in_flight(bufnr)
   end
+
+  cancel_prefetch(bufnr)
 
   -- Clear ghost text
   render.clear(bufnr)

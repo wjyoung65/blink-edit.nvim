@@ -20,6 +20,9 @@ end
 function M.debug(msg, level)
   if vim.g.blink_edit_debug then
     notify(msg, level or vim.log.levels.DEBUG)
+    vim.schedule(function()
+      pcall(vim.api.nvim_echo, { { "[blink-edit] " .. msg } }, true, {})
+    end)
   end
 end
 

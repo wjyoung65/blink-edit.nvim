@@ -15,6 +15,8 @@ local ns = vim.api.nvim_create_namespace("blink-edit")
 ---@type table<number, number[]> Buffer -> list of extmark IDs
 local extmarks = {}
 
+local JUMP_TEXT = " ⇥ TAB "
+
 -- =============================================================================
 -- Display Functions (one per hunk type)
 -- =============================================================================
@@ -174,6 +176,49 @@ local function show_replacement(bufnr, hunk, window_start, extmark_list)
   end
 end
 
+--- Get a stable anchor line for jump indicators
+---@param bufnr number
+---@param hunk DiffHunk
+---@param window_start number
+---@return number|nil line_0
+local function get_jump_anchor_line(bufnr, hunk, window_start)
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if line_count <= 0 then
+    return nil
+  end
+
+  local anchor_line = window_start + hunk.start_old - 1
+  local anchor_line_0 = anchor_line - 1
+
+  if anchor_line_0 < 0 then
+    anchor_line_0 = 0
+  end
+  if anchor_line_0 >= line_count then
+    anchor_line_0 = line_count - 1
+  end
+
+  return anchor_line_0
+end
+
+--- Show a jump indicator for the next hunk (rendered as a virtual line below the target)
+---@param bufnr number
+---@param hunk DiffHunk
+---@param window_start number
+---@param extmark_list number[]
+local function show_jump_indicator(bufnr, hunk, window_start, extmark_list)
+  local anchor_line_0 = get_jump_anchor_line(bufnr, hunk, window_start)
+  if anchor_line_0 == nil then
+    return
+  end
+
+  -- Render as a virtual line below the target hunk
+  local mark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, anchor_line_0, 0, {
+    virt_lines = { { { JUMP_TEXT, "BlinkEditJump" } } },
+    virt_lines_above = false, -- Show below the anchor line
+  })
+  table.insert(extmark_list, mark_id)
+end
+
 -- =============================================================================
 -- Public API
 -- =============================================================================
@@ -240,11 +285,15 @@ function M.show(bufnr, prediction)
   -- Process each hunk, but only if at or below cursor (next-edit semantics)
   local shown_count = 0
   local skipped_count = 0
+  local first_hunk = nil
 
   for _, hunk in ipairs(diff_result.hunks) do
     -- Only show hunks at or below cursor position
     if hunk.start_old >= cursor_offset then
       shown_count = shown_count + 1
+      if not first_hunk then
+        first_hunk = hunk
+      end
       if hunk.type == "insertion" then
         show_insertion(bufnr, hunk, window_start, extmarks[bufnr])
       elseif hunk.type == "deletion" then
@@ -267,6 +316,27 @@ function M.show(bufnr, prediction)
         )
       end
     end
+  end
+
+  if not first_hunk and prediction.allow_fallback and diff_result.has_changes and #diff_result.hunks > 0 then
+    local fallback = diff_result.hunks[1]
+    if vim.g.blink_edit_debug then
+      log.debug("Render fallback: showing first hunk above cursor")
+    end
+    if fallback.type == "insertion" then
+      show_insertion(bufnr, fallback, window_start, extmarks[bufnr])
+    elseif fallback.type == "deletion" then
+      show_deletion(bufnr, fallback, window_start, extmarks[bufnr])
+    elseif fallback.type == "modification" then
+      show_modification(bufnr, fallback, window_start, extmarks[bufnr])
+    elseif fallback.type == "replacement" then
+      show_replacement(bufnr, fallback, window_start, extmarks[bufnr])
+    end
+    first_hunk = fallback
+  end
+
+  if first_hunk then
+    show_jump_indicator(bufnr, first_hunk, window_start, extmarks[bufnr])
   end
 
   if vim.g.blink_edit_debug then
@@ -328,13 +398,11 @@ local function build_merged_result(prediction)
   return merged, cursor_offset, line_offset
 end
 
---- Apply the current prediction to the buffer
---- Only applies changes at or below cursor position (next-edit semantics)
---- Keeps snapshot content above cursor, uses predicted content at/below cursor
+--- Apply a prediction to the buffer (uses supplied prediction)
 ---@param bufnr number
+---@param prediction BlinkEditPrediction
 ---@return boolean success, string[]|nil merged_lines
-function M.apply(bufnr)
-  local prediction = state.get_prediction(bufnr)
+local function apply_prediction(bufnr, prediction)
   if not prediction then
     return false, nil
   end
@@ -342,7 +410,6 @@ function M.apply(bufnr)
   local window_start = prediction.window_start
   local snapshot = prediction.snapshot_lines
   local predicted = prediction.predicted_lines
-  local cursor = prediction.cursor
 
   if not snapshot or not predicted then
     return false, nil
@@ -397,6 +464,24 @@ function M.apply(bufnr)
   extmarks[bufnr] = nil
 
   return true, merged
+end
+
+--- Apply the current prediction to the buffer
+--- Only applies changes at or below cursor position (next-edit semantics)
+--- Keeps snapshot content above cursor, uses predicted content at/below cursor
+---@param bufnr number
+---@return boolean success, string[]|nil merged_lines
+function M.apply(bufnr)
+  local prediction = state.get_prediction(bufnr)
+  return apply_prediction(bufnr, prediction)
+end
+
+--- Apply a supplied prediction (used for partial hunks)
+---@param bufnr number
+---@param prediction BlinkEditPrediction
+---@return boolean success, string[]|nil merged_lines
+function M.apply_with_prediction(bufnr, prediction)
+  return apply_prediction(bufnr, prediction)
 end
 
 --- Get namespace ID (for testing/debugging)

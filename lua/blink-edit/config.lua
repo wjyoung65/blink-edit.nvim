@@ -73,6 +73,15 @@
 ---@field daemon_socket string
 ---@field daemon_auto_start boolean
 ---@field fallback_to_direct boolean
+---@field prefetch BlinkEditPrefetchConfig
+---@field normal_mode BlinkEditNormalModeConfig
+
+---@class BlinkEditPrefetchConfig
+---@field enabled boolean
+---@field strategy string
+
+---@class BlinkEditNormalModeConfig
+---@field enabled boolean
 
 local M = {}
 
@@ -158,7 +167,7 @@ local defaults = {
   ---------------------------------------------------------
   -- Timing
   ---------------------------------------------------------
-  debounce_ms = 100, -- Delay before sending request
+  debounce_ms = 50, -- Delay before sending request
   cancel_in_flight = true, -- Cancel TCP when new request queued (faster iteration)
 
   ---------------------------------------------------------
@@ -213,10 +222,27 @@ local defaults = {
     addition = { bg = "#394f2f" }, -- Added text background
     deletion = { bg = "#4f2f2f" }, -- Deleted text background
     preview = { fg = "#80899c", italic = true }, -- Ghost text
+    jump = { fg = "#5c6370", bg = "#2d3343", bold = true }, -- Jump indicator (⇥ TAB)
   },
 
   ui = {
     progress = true, -- Show "thinking..." indicator when in-flight
+    suppress_lsp_floats = true, -- Hide LSP float dialogs while predictions are visible
+  },
+
+  ---------------------------------------------------------
+  -- Prefetch (Speculative)
+  ---------------------------------------------------------
+  prefetch = {
+    enabled = false, -- May use extra tokens
+    strategy = "n-1", -- Trigger prefetch when one hunk remains
+  },
+
+  ---------------------------------------------------------
+  -- Normal Mode Completions
+  ---------------------------------------------------------
+  normal_mode = {
+    enabled = false,
   },
 
   ---------------------------------------------------------
@@ -415,6 +441,30 @@ local function validate_config(cfg)
   end
   if history.max_files < 0 then
     error("[blink-edit] context.history.max_files must be >= 0")
+  end
+
+  -- UI validation
+  if cfg.ui then
+    if cfg.ui.suppress_lsp_floats ~= nil and type(cfg.ui.suppress_lsp_floats) ~= "boolean" then
+      error("[blink-edit] ui.suppress_lsp_floats must be a boolean")
+    end
+  end
+
+  -- Prefetch validation
+  if cfg.prefetch then
+    if type(cfg.prefetch.enabled) ~= "boolean" then
+      error("[blink-edit] prefetch.enabled must be a boolean")
+    end
+    if cfg.prefetch.strategy ~= nil and type(cfg.prefetch.strategy) ~= "string" then
+      error("[blink-edit] prefetch.strategy must be a string")
+    end
+  end
+
+  -- Normal mode validation
+  if cfg.normal_mode then
+    if type(cfg.normal_mode.enabled) ~= "boolean" then
+      error("[blink-edit] normal_mode.enabled must be a boolean")
+    end
   end
 
   local ollama_cfg = cfg.backends.ollama

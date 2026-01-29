@@ -20,6 +20,7 @@ local log = require("blink-edit.log")
 ---@field window_end number 1-indexed end line
 ---@field cursor { [1]: number, [2]: number } Cursor position when captured
 ---@field timestamp number
+---@field force_request boolean|nil
 
 ---@class BlinkEditPrediction
 ---@field predicted_lines string[] Full predicted window content from LLM
@@ -30,6 +31,14 @@ local log = require("blink-edit.log")
 ---@field created_at number
 ---@field cursor_after { [1]: number, [2]: number }|nil Cursor position after applying (completion)
 ---@field cursor { [1]: number, [2]: number } Cursor position when prediction was made
+---@field allow_fallback boolean|nil
+
+---@class BlinkEditPrefetch
+---@field request_id number|nil
+---@field snapshot BlinkEditSnapshot|nil
+---@field prediction BlinkEditPrediction|nil
+---@field created_at number|nil
+---@field in_flight boolean|nil
 
 ---@class BlinkEditHistoryEntry
 ---@field filepath string
@@ -61,6 +70,9 @@ local log = require("blink-edit.log")
 ---@field history BlinkEditHistoryEntry[]
 ---@field selection BlinkEditSelection|nil
 ---@field history_files string[]|nil
+---@field suppress_next_trigger boolean|nil
+---@field invalid_response { fingerprint: string, count: number }|nil
+---@field prefetch BlinkEditPrefetch|nil
 
 ---@type table<number, BlinkEditBufferState>
 local buffers = {}
@@ -131,6 +143,9 @@ local function get_or_create(bufnr)
       history = {},
       selection = nil,
       history_files = nil,
+      suppress_next_trigger = false,
+      invalid_response = nil,
+      prefetch = nil,
     }
   end
   return buffers[bufnr]
@@ -391,6 +406,86 @@ function M.clear_prediction(bufnr)
   local state = buffers[bufnr]
   if state then
     state.prediction = nil
+  end
+end
+
+-- =============================================================================
+-- Trigger Suppression
+-- =============================================================================
+
+--- Suppress the next TextChangedI trigger for a buffer
+---@param bufnr number
+---@param value boolean
+function M.set_suppress_trigger(bufnr, value)
+  local state = get_or_create(bufnr)
+  state.suppress_next_trigger = value and true or false
+end
+
+--- Consume the suppress flag (returns true once)
+---@param bufnr number
+---@return boolean
+function M.consume_suppress_trigger(bufnr)
+  local state = buffers[bufnr]
+  if state and state.suppress_next_trigger then
+    state.suppress_next_trigger = false
+    return true
+  end
+  return false
+end
+
+-- =============================================================================
+-- Invalid Response Tracking
+-- =============================================================================
+
+--- Increment invalid response count for a fingerprint
+---@param bufnr number
+---@param fingerprint string
+---@return number count
+function M.bump_invalid_response(bufnr, fingerprint)
+  local state = get_or_create(bufnr)
+  if state.invalid_response and state.invalid_response.fingerprint == fingerprint then
+    state.invalid_response.count = state.invalid_response.count + 1
+  else
+    state.invalid_response = { fingerprint = fingerprint, count = 1 }
+  end
+  return state.invalid_response.count
+end
+
+--- Clear invalid response tracking
+---@param bufnr number
+function M.clear_invalid_response(bufnr)
+  local state = buffers[bufnr]
+  if state then
+    state.invalid_response = nil
+  end
+end
+
+-- =============================================================================
+-- Prefetch Management
+-- =============================================================================
+
+--- Store prefetch state
+---@param bufnr number
+---@param prefetch BlinkEditPrefetch|nil
+function M.set_prefetch(bufnr, prefetch)
+  local state = get_or_create(bufnr)
+  state.prefetch = prefetch
+end
+
+--- Get prefetch state
+---@param bufnr number
+---@return BlinkEditPrefetch|nil
+function M.get_prefetch(bufnr)
+  local state = buffers[bufnr]
+  return state and state.prefetch
+end
+
+--- Clear prefetch state
+---@param bufnr number
+function M.clear_prefetch(bufnr)
+  local state = buffers[bufnr]
+  if state then
+    state.prefetch = nil
   end
 end
 
