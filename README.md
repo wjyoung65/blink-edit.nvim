@@ -19,7 +19,7 @@
 
 *⚠️ **Alpha** — Expect breaking changes and rapid iteration ⚠️*
 
-<img src="assets/BlinkEdit.gif" alt="blink-edit demo">
+<img src="https://github.com/BlinkResearchLabs/blink-edit.nvim/releases/download/media/BlinkEdit.gif" alt="blink-edit demo">
 
 </div>
 
